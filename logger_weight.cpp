@@ -9,7 +9,13 @@
 #include <lvgl.h>
 #include "LGFX_Driver.h"
 
-SemaphoreHandle_t file_mutex;
+#include <XPT2046_Touchscreen.h>
+#include <SPI.h>
+
+TaskHandle_t task_display;
+SemaphoreHandle_t file_mutex; // -> file secure
+SemaphoreHandle_t lvgl_mutex; // -> display secure
+SemaphoreHandle_t data_mutex; // -> weight value secure
 
 #define RX_PIN 22
 #define TX_PIN 27
@@ -17,10 +23,42 @@ SemaphoreHandle_t file_mutex;
 
 #define BUFFER_SIZE 64
 char buffer[BUFFER_SIZE];
+// XPT2046_Touchscreen ts(TOUCH_CS, TOUCH_IRQ);
 
 volatile float data_weight = 0;
 hw_timer_t* timer_data = NULL;
 volatile bool flag_read_data = false;
+
+bool time_synced = false; // -> флаг синхронизации времени
+
+float get_data_weight();
+void set_weight(float weight);
+
+void update_label_weight();
+void update_label_time();
+
+void update_chart();
+
+void display_task_function(void* param) {
+  initial_display();
+  create_window_logger();
+
+  for (;;) { // -> loop()
+    if (xSemaphoreTake(lvgl_mutex, portMAX_DELAY)) {
+      
+      lv_tick_inc(5); // -> !!!!! важный момент, из-за этого дисплей не обновлялся
+      
+      lv_timer_handler();
+      
+      update_label_weight();
+      update_label_time();
+      update_chart();
+
+      xSemaphoreGive(lvgl_mutex);
+    }
+    vTaskDelay(5 / portTICK_PERIOD_MS);
+  }
+}
 
 void initial_port() {
   Serial1.begin(BAUD_RATE, SERIAL_8N1, RX_PIN, TX_PIN);
@@ -574,6 +612,28 @@ void initial_timer() {
     now.tv_sec = times;
     now.tv_usec = 0;
     settimeofday(&now, nullptr);
+
+    time_synced = true;
+  }
+
+  void set_default_time() {
+    struct tm t = {};
+
+    t.tm_year = 2024 - 1900;
+    t.tm_mon  = 0;   // Январь
+    t.tm_mday = 1;
+    t.tm_hour = 0;
+    t.tm_min  = 0;
+    t.tm_sec  = 0;
+
+    time_t tt = mktime(&t);
+
+    struct timeval now;
+    now.tv_sec = tt;
+    now.tv_usec = 0;
+
+    settimeofday(&now, nullptr);
+    time_synced = false;
   }
 
   String get_current_datetime() { // -> получение времени из модуля rtc
@@ -648,7 +708,7 @@ void initial_timer() {
     });
 
     server.on("/getData", HTTP_GET, [](AsyncWebServerRequest* request) {
-      request -> send(200, "text/plain", String(data_weight));
+      request -> send(200, "text/plain", String(get_data_weight(), 3));
     });
 
     server.on("/downloadData", HTTP_GET, [](AsyncWebServerRequest* request) {
@@ -678,7 +738,7 @@ void initial_timer() {
   static lv_color_t buf[320 * 10];
   static lv_disp_drv_t disp_drv;
 
-  void my_flush_disp(lv_disp_drv_t* disp,
+  static void my_flush_disp(lv_disp_drv_t* disp,
                      const lv_area_t* area,
                      lv_color_t* color_p) { // -> инициализация буфера
     uint32_t width = area -> x2 - area -> x1 + 1;
@@ -709,6 +769,7 @@ void initial_timer() {
 
     lv_obj_t* chart_panel;
     lv_obj_t* chart;
+    lv_chart_series_t* weight_series;
 
     lv_obj_t* footer_panel;
     lv_obj_t* btn_start;
@@ -786,6 +847,17 @@ void initial_timer() {
     void create_chart_panel(lv_obj_t* scr) {
       chart_panel = create_panel(scr, 320, 80, LV_ALIGN_TOP_MID, 0, 125);
       chart = create_chart(chart_panel, LV_ALIGN_TOP_MID);
+
+      weight_series = lv_chart_add_series(
+        chart, 
+        lv_palette_main(LV_PALETTE_RED), 
+        LV_CHART_AXIS_PRIMARY_Y
+      );
+    }
+
+    void update_chart() {
+      float weight = get_data_weight();
+      lv_chart_set_next_value(chart, weight_series, weight);
     }
 
     lv_obj_t* create_btn(lv_obj_t* scr, 
@@ -810,7 +882,7 @@ void initial_timer() {
       footer_panel = create_panel(scr, 320, 35, LV_ALIGN_BOTTOM_MID, 0, 0);
       btn_start = create_btn(footer_panel, lv_palette_main(LV_PALETTE_GREEN), "START", 80, 28, LV_ALIGN_TOP_LEFT, 0, -11);
       btn_stop = create_btn(footer_panel, lv_palette_main(LV_PALETTE_RED), "STOP", 80, 28, LV_ALIGN_TOP_MID, 0, -11);
-      btn_save = create_btn(footer_panel, lv_palette_main(LV_PALETTE_BLUE), "STOP", 80, 28, LV_ALIGN_TOP_RIGHT, 0, -11);
+      btn_save = create_btn(footer_panel, lv_palette_main(LV_PALETTE_BLUE), "SAVE", 80, 28, LV_ALIGN_TOP_RIGHT, 0, -11);
     }
 
     void create_window_logger() {
@@ -819,6 +891,37 @@ void initial_timer() {
       create_main_part_window(scr);
       create_chart_panel(scr);
       create_footer_panel(scr);
+    }
+
+    void update_label_weight() {
+      float weight_data = get_data_weight();
+      char buf[32];
+      snprintf(buf, sizeof(buf), "%.3f g", weight_data);
+      lv_label_set_text(weight_label_value, buf);
+    }
+
+    void update_label_time() { // -> проблемный метод
+      static unsigned long last_time_update = 0;
+
+      if (millis() - last_time_update < 1000) {
+        return;
+      }
+      last_time_update = millis();
+      
+      time_t now;
+      time(&now);
+
+      struct tm timeinfo;
+      localtime_r(&now, &timeinfo);
+
+      char date_buf[16];
+      char time_buf[16];
+
+      strftime(date_buf, sizeof(date_buf), "%Y-%m-%d", &timeinfo);
+      strftime(time_buf, sizeof(time_buf), "%H:%M:%S", &timeinfo);
+
+      lv_label_set_text(label_date_value, date_buf);
+      lv_label_set_text(label_time_value, time_buf);
     }
   // -> GUI
 
@@ -851,7 +954,19 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
+  set_default_time();
+
   file_mutex = xSemaphoreCreateMutex();
+  lvgl_mutex = xSemaphoreCreateMutex();
+  data_mutex = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(
+    display_task_function, 
+    "Display Task", 
+    10000, NULL, 
+    1, 
+    &task_display, 
+    0
+  );
 
   initial_port();
   initial_timer();
@@ -860,9 +975,22 @@ void setup() {
 
   intial_wifi_ap();
   start_server();
+}
 
-  initial_display();
-  create_window_logger();
+void set_weight(float weight) { // -> secure set value data
+  if (xSemaphoreTake(data_mutex, portMAX_DELAY)) {
+    data_weight = weight;
+    xSemaphoreGive(data_mutex);
+  }
+}
+
+float get_data_weight() { // -> secure get value weight 
+  float weight_secure = 0;
+  if (xSemaphoreTake(data_mutex, portMAX_DELAY)) {
+    weight_secure = data_weight;
+    xSemaphoreGive(data_mutex);
+  }
+  return weight_secure;
 }
 
 void loop() {
@@ -877,14 +1005,14 @@ void loop() {
           p++;
         }
         if (*p != '\0') {
-          data_weight = atof(p);
+          set_weight(atof(p));
           Serial.print("Weight: ");
-          Serial.println(data_weight, 3);
+          Serial.println(get_data_weight(), 3);
           if (expirement_active && expirement_file) {
             if (xSemaphoreTake(file_mutex, portMAX_DELAY)) {
               expirement_file.print(get_current_datetime());
               expirement_file.print(",");
-              expirement_file.println(data_weight, 3);
+              expirement_file.println(get_data_weight(), 3);
               expirement_file.flush();
               xSemaphoreGive(file_mutex);
             }
@@ -895,7 +1023,4 @@ void loop() {
       }
     }
   }
-
-  lv_timer_handler();
-  delay(5);
 }
