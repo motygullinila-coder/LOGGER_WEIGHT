@@ -1,6 +1,3 @@
-Да. Ниже просто готовый текст **без пояснений**, который можно сразу скопировать в файл `README.md`.
-
-```markdown
 # TOREX DATA LOGGER
 
 ## ESP32-based Weight Measurement and Data Logging System
